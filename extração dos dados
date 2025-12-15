@@ -1,0 +1,323 @@
+import requests
+import os
+import json
+import base64
+from pathlib import Path
+
+#coloque aqui sua chave de API
+API_KEY_REF = "XXXXX"
+
+def encode_pdf_to_base64(pdf_path):
+    with open(pdf_path, "rb") as pdf_file:
+        return base64.b64encode(pdf_file.read()).decode('utf-8')
+
+url = "https://openrouter.ai/api/v1/chat/completions"
+headers = {
+    "Authorization": f"Bearer {API_KEY_REF}",
+    "Content-Type": "application/json"
+}
+
+plugins = [
+    {
+        "id": "file-parser",
+        "pdf": {
+            "engine": "pdf-text"
+        }
+    }
+]
+
+os.makedirs('arquivos', exist_ok=True)
+print("Directory 'arquivos' created or already exists.")
+
+import re
+from typing import Any, Dict
+
+
+def to_int_or_none(value: Any) -> int | None:
+    """
+    Converte valores que representam inteiros para int.
+    Aceita:
+      - int
+      - string com pontos como separador de milhar ("5.813", "15.040", "59184")
+      - string com espaços etc.
+    Se não der pra converter, retorna None.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        # se por algum motivo vier float, converte truncando
+        return int(value)
+
+    if isinstance(value, str):
+        # remove tudo que não for dígito
+        cleaned = re.sub(r"[^\d]", "", value)
+        if not cleaned:
+            return None
+        try:
+            return int(cleaned)
+        except ValueError:
+            return None
+
+    # qualquer outro tipo, ignora
+    return None
+
+
+def normalizar_situacao(raw: Any) -> str | None:
+    """
+    Normaliza a situação do projeto em:
+      - 'APROVADO'
+      - 'REPROVADO'
+      - 'OUTRO' (se quiser manter um padrão)
+    Se não houver valor, retorna None.
+    """
+    if raw is None:
+        return None
+
+    s = str(raw).strip().upper()
+
+    if "APROV" in s:
+        return "APROVADO"
+    if "REPROV" in s:
+        return "REPROVADO"
+
+    # se quiser manter o valor original upper:
+    return s or None
+
+
+def flatten_itens(itens: Any) -> Dict[str, str]:
+    """
+    Garante que demonstrativo_despesas.itens seja SEMPRE um dict "flat":
+      { "Descrição": "R$ 123,00", ... }
+
+    Se vier algo assim:
+      {
+        "Custeio": {
+          "Recursos humanos": "R$ 3.319.280,58"
+        },
+        "Captação de recursos": "R$ 50.000,00",
+        "Capital": {
+          "Equipamentos": "R$ 228.317,00"
+        }
+      }
+
+    Vai virar:
+      {
+        "Recursos humanos": "R$ 3.319.280,58",
+        "Captação de recursos": "R$ 50.000,00",
+        "Equipamentos": "R$ 228.317,00"
+      }
+    """
+    if not isinstance(itens, dict):
+        return {}
+
+    result: Dict[str, str] = {}
+
+    for key, value in itens.items():
+        if isinstance(value, dict):
+            # aninhação: puxa os campos internos
+            for sub_key, sub_val in value.items():
+                result[str(sub_key)] = str(sub_val)
+        else:
+            result[str(key)] = str(value)
+
+    return result
+
+def normalizar_registro(registro: dict) -> dict:
+    """
+    Aplica as normalizações no objeto retornado pela IA
+    sem mudar a estrutura do schema.
+    """
+
+    # --- Normalizar projeto ---
+    projeto = registro.get("projeto", {})
+    if isinstance(projeto, dict):
+        projeto["numero_total_atendimentos"] = to_int_or_none(
+            projeto.get("numero_total_atendimentos")
+        )
+        projeto["prazo_execucao_meses"] = to_int_or_none(
+            projeto.get("prazo_execucao_meses")
+        )
+
+    # --- Normalizar metas_aprovadas ---
+    metas = registro.get("metas_aprovadas", {})
+    if isinstance(metas, dict):
+        metas["total_previsto"] = to_int_or_none(metas.get("total_previsto"))
+        metas["periodo_meses"] = to_int_or_none(metas.get("periodo_meses"))
+
+    # --- Normalizar conclusao ---
+    conclusao = registro.get("conclusao", {})
+    if isinstance(conclusao, dict):
+        conclusao["situacao"] = normalizar_situacao(conclusao.get("situacao"))
+        conclusao["prazo_maximo_execucao_meses"] = to_int_or_none(
+            conclusao.get("prazo_maximo_execucao_meses")
+        )
+
+    # --- Normalizar demonstrativo_despesas.itens ---
+    demo = registro.get("demonstrativo_despesas", {})
+    if isinstance(demo, dict):
+        demo["itens"] = flatten_itens(demo.get("itens", {}))
+
+    # Você pode acrescentar outras normalizações aqui, se quiser
+
+    return registro
+
+all_extracted_data = []
+pdf_directory = 'arquivos'
+
+if not os.path.exists(pdf_directory):
+    print(f"Directory '{pdf_directory}' does not exist. Please create it and place PDF files inside.")
+else:
+    for filename in os.listdir(pdf_directory):
+        if filename.endswith('.pdf'):
+            current_pdf_path = os.path.join(pdf_directory, filename)
+            print(f"Processing PDF: {filename}")
+
+            try:
+                base64_pdf = encode_pdf_to_base64(current_pdf_path)
+                data_url = f"data:application/pdf;base64,{base64_pdf}"
+
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Vou enviar abaixo o texto extraído de um PDF.Sua tarefa é extrair as principais informações estruturadas e devolver APENAS UM JSON VÁLIDO, seguindo EXATAMENTE o schema abaixo.Regras obrigatórias:Use exatamente as chaves definidas no schema abaixo.NÃO CRIE CHAVES NOVAS.Se uma informação não estiver presente no texto, preencha com:null para strings ou números;[] para listas;{} para objetos.Mantenha os valores em português, sem traduzir.Campos monetários devem ser copiados exatamente como aparecem (ex: 'R$ 1.234.567,89').A resposta deve conter apenas o JSON, sem nenhuma explicação antes ou depois."
+                            },
+                            {
+                                "type": "text",
+                                "text": """Schema a ser seguido (não é exemplo, é o formato exato): {
+  "file_name": null,
+  "documento": {
+    "data_emissao": null,
+    "hora_emissao": null,
+    "tipo_documento": null,
+    "numero_parecer": null,
+    "instancia": null,
+    "pagina": null
+  },
+  "processo": {
+    "numero_processo": null,
+    "sei": null,
+    "url_acesso": null
+  },
+  "instituicao": {
+    "razao_social": null,
+    "cnpj": null,
+    "cnes": null,
+    "municipio": null,
+    "gestao": null,
+    "habilitacao_rcpd": null,
+    "telefones": [],
+    "emails": []
+  },
+  "projeto": {
+    "codigo_parceria": null,
+    "titulo": null,
+    "prazo_execucao_meses": null,
+    "campo_atuacao": null,
+    "areas_prioritarias": [],
+    "objetivo_geral": null,
+    "numero_total_atendimentos": null,
+    "modalidade_reabilitacao": [],
+    "abrangencia_geografica": []
+  },
+  "demonstrativo_despesas": {
+    "natureza": null,
+    "total_solicitado": null,
+    "total_aprovado": null,
+    "itens": {},
+    "observacoes": null
+  },
+  "metas_aprovadas": {
+    "modalidade_atendimento": null,
+    "total_previsto": null,
+    "periodo_meses": null
+  },
+  "analise_projeto": {
+    "conformidade": [],
+    "documentos_faltantes": [],
+    "motivos_reprovacao": [],
+    "base_legal": []
+  },
+  "conclusao": {
+    "situacao": null,
+    "valor_aprovado": null,
+    "conformidade_normativa": [],
+    "prazo_maximo_execucao_meses": null,
+    "condicoes": [],
+    "observacoes": null,
+    "responsabilidades": null
+  },
+  "assinaturas": {
+    "coordenador_geral": {
+      "nome": null,
+      "cargo": null,
+      "data_assinatura": null
+    },
+    "diretor_departamento": {
+      "nome": null,
+      "cargo": null,
+      "data_assinatura": null
+    },
+    "secretario": {
+      "nome": null,
+      "cargo": null,
+      "data_assinatura": null
+    }
+  },
+  "verificacao": {
+    "codigo_verificador": null,
+    "codigo_crc": null,
+    "link_verificacao": null
+  }
+}
+"""
+                            },
+                            {
+                                "type": "file",
+                                "file": {
+                                    "filename": filename,
+                                    "file_data": data_url
+                                }
+                            }
+                        ],
+                        "response_format": {
+                            "type": "json_object"
+                        }
+                    }
+                ]
+
+                payload = {
+                    "model": "amazon/nova-2-lite-v1:free",
+                    "messages": messages,
+                    "plugins": plugins
+                }
+
+                response = requests.post(url, headers=headers, json=payload)
+
+                if response.status_code == 200:
+                    response_json = response.json()
+                    content_string = response_json['choices'][0]['message']['content']
+                    cleaned_json_string = content_string.replace('```json\n', '').replace('\n```', '')
+                    parsed_content_json = json.loads(cleaned_json_string)
+                    parsed_content_json = normalizar_registro(parsed_content_json)
+                    all_extracted_data.append(parsed_content_json)
+                    print(f"Successfully extracted data from {filename}")
+                else:
+                    print(f"Error processing {filename}: Status Code {response.status_code}, Response: {response.text}")
+
+            except Exception as e:
+                print(f"An error occurred while processing {filename}: {e}")
+
+    # After processing all PDFs, save the consolidated data
+    if all_extracted_data:
+        with open('todos_os_dados.json', 'w', encoding='utf-8') as json_file:
+            json.dump(all_extracted_data, json_file, indent=2, ensure_ascii=False)
+        print("All extracted data saved to 'todos_os_dados.json'")
+    else:
+        print("No data extracted from any PDF. 'todos_os_dados.json' was not created.")
