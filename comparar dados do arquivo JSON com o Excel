@@ -1,0 +1,192 @@
+import json
+import pandas as pd
+import re
+from thefuzz import fuzz
+
+# Helpers
+def normalize(text):
+    if text is None:
+        return ""
+    text = str(text).strip().lower()
+    # remove acentos básicos
+    replacements = {
+        "á":"a","à":"a","ã":"a","â":"a",
+        "é":"e","ê":"e",
+        "í":"i",
+        "ó":"o","ô":"o","õ":"o",
+        "ú":"u","ü":"u",
+        "ç":"c"
+    }
+    for k,v in replacements.items():
+        text = text.replace(k, v)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def is_equal(a, b, fuzz_threshold=85):
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return True
+    if na == "" and nb == "":
+        return True
+    # partial fuzzy (moderado)
+    try:
+        ratio = fuzz.partial_ratio(na, nb)
+    except Exception:
+        ratio = 0
+    return ratio >= fuzz_threshold
+
+def listify(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [normalize(v) for v in value]
+    return [normalize(v) for v in re.split(r"[;/,]", str(value)) if v.strip()]
+
+def lists_equal(a, b):
+    la, lb = sorted(listify(a)), sorted(listify(b))
+    return la == lb
+
+def somente_numero_float(s):
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "":
+        return None
+    s2 = s.replace("R$", "").replace("R", "").replace(" ", "")
+    if re.match(r"^[\d\.]+,\d{1,2}$", s2):
+        sn = s2.replace(".", "").replace(",", ".")
+    else:
+        sn = re.sub(r"[^0-9\.\-]", "", s2)
+    try:
+        return float(sn)
+    except:
+        return None
+
+def idx_to_excel_col(idx: int) -> str:
+    letters = ""
+    i = idx
+    while i >= 0:
+        letters = chr((i % 26) + ord('A')) + letters
+        i = i // 26 - 1
+    return letters
+
+# Load Excel (header=1 -> linha 2 é o cabeçalho)
+excel_file = "t03.xlsx"
+df = pd.read_excel(excel_file, header=1).fillna("")
+
+# Normalize column names
+orig_columns = list(df.columns)
+df.columns = [normalize(c) for c in orig_columns]
+
+# Required column
+col_codigo = normalize("CÓDIGO DA PARCERIA")
+if col_codigo not in df.columns:
+    raise SystemExit(f"Coluna obrigatória '{col_codigo}' não encontrada. Colunas: {df.columns.tolist()}")
+
+# Campos a comparar (nome apresentado -> (coluna_excel_normalizada, caminho_json))
+campos = {
+    "PERÍODO DE EXECUÇÃO (MESES)": (normalize("PERÍODO DE EXECUÇÃO (MESES)"), "projeto.prazo_execucao_meses"),
+    "CAMPO DE ATUAÇÃO": (normalize("CAMPO DE ATUAÇÃO"), "projeto.campo_atuacao"),
+    "OBJETIVO GERAL": (normalize("OBJETIVO GERAL"), "projeto.objetivo_geral"),
+    "Nº DE ATENDIMENTOS PREVISTOS NO PROJETO APROVADO": (normalize("Nº DE ATENDIMENTOS PREVISTOS NO PROJETO APROVADO"), "projeto.numero_total_atendimentos"),
+    "MODALIDADE DE ATENDIMENTO INTELECTUAL": (normalize("MODALIDADE DE ATENDIMENTO INTELECTUAL"), "projeto.modalidade_reabilitacao"),
+}
+
+# Load JSON
+with open("todos_os_dados.json", "r", encoding="utf-8") as f:
+    json_data = json.load(f)
+
+divergencias = []
+reg_processados = 0
+reg_sem_correspondencia = 0
+
+for entry in json_data:
+    codigo = entry.get("projeto", {}).get("codigo_parceria") or entry.get("projeto", {}).get("codigo")
+    if not codigo:
+        # pula registros sem código
+        continue
+    codigo_norm = normalize(codigo)
+
+    # procurar linha no excel
+    matches = df.index[df[col_codigo].apply(lambda x: normalize(x) == codigo_norm)].tolist()
+    if not matches:
+        reg_sem_correspondencia += 1
+        continue
+
+    idx = matches[0]  # índice 0-based no DataFrame
+    reg_processados += 1
+
+    tecnico_col = normalize("TÉCNICO")
+    tecnico = df.loc[idx, tecnico_col] if tecnico_col in df.columns else ""
+
+    for nome_humano, (col_excel_norm, json_path) in campos.items():
+        if col_excel_norm not in df.columns:
+            continue
+
+        excel_val = df.loc[idx, col_excel_norm]
+
+        # extrair valor do JSON pelo caminho
+        j = entry
+        for part in json_path.split("."):
+            j = j.get(part, None) if isinstance(j, dict) else None
+        pdf_val = j
+
+        # comparar
+        iguais = False
+
+        # modalidades: comparar presença/ausência na lista
+        if "modalidade" in nome_humano.lower():
+            iguais = lists_equal(excel_val, pdf_val)
+        else:
+            # tenta comparar como número se possível
+            excel_num = somente_numero_float(excel_val)
+            pdf_num = None
+            if isinstance(pdf_val, (int, float)):
+                pdf_num = float(pdf_val)
+            else:
+                pdf_num = somente_numero_float(pdf_val)
+
+            if excel_num is not None and pdf_num is not None:
+                iguais = abs(excel_num - pdf_num) < 0.01
+            else:
+                iguais = is_equal(excel_val, pdf_val)
+
+        if not iguais:
+            # calcula célula Excel (coluna letra + linha real)
+            try:
+                col_idx = list(df.columns).index(col_excel_norm)
+                col_letter = idx_to_excel_col(col_idx)
+                excel_row = idx + 2  # header=1 => first data row is line 2
+                celula = f"{col_letter}{excel_row}"
+            except Exception:
+                celula = f"linha {idx+2}"
+
+            divergencias.append({
+                "arquivo": entry.get("file_name", ""),
+                "codigo": codigo,
+                "campo": nome_humano,
+                "pdf": pdf_val,
+                "excel": excel_val,
+                "tecnico": tecnico,
+                "linha": idx + 2,
+                "celula_excel": celula
+            })
+
+# Print resultado (com célula no formato A34)
+print("\n==== RESULTADO FINAL ====\n")
+if not divergencias:
+    print("Nenhuma divergência encontrada.")
+else:
+    print(f"🔎 Divergências encontradas: {len(divergencias)}\n")
+    for d in divergencias:
+        print(f"📌 Arquivo: {d['arquivo']}")
+        print(f"   Código: {d['codigo']}")
+        print(f"   Campo divergente: {d['campo']}")
+        print(f"   → PDF : {d['pdf']}")
+        print(f"   → Excel : {d['excel']}")
+        print(f"   Técnico responsável: {d['tecnico']}")
+        print(f"   Célula Excel: {d['celula_excel']}")
+        print("------------------------------------------------------------")
+
+print(f"\n📄 JSON processados com sucesso: {reg_processados}")
+print(f"⚠ JSON sem correspondência no Excel: {reg_sem_correspondencia}\n")
