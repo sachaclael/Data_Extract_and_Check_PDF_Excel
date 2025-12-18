@@ -293,7 +293,7 @@ else:
                 ]
 
                 payload = {
-                    "model": "amazon/nova-2-lite-v1:free",
+                    "model": "meta-llama/llama-3-8b-instruct",
                     "messages": messages,
                     "plugins": plugins
                 }
