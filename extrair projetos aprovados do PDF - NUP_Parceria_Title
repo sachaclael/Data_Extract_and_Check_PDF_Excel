@@ -1,0 +1,117 @@
+import pdfplumber
+import pandas as pd
+import re
+
+#EDITE aqui o nome do PDF
+pdf_path = "ms01.pdf"
+
+# Regex
+regex_nup_numero = re.compile(r"\b\d{5}\.\d{6}/\d{4}-\d{2}\b")
+regex_parceria = re.compile(r"Parceria\s*[:\-]?\s*(\d{4}-\d+)", re.IGNORECASE)
+regex_titulo_inicio = re.compile(r"T[ií]tulo\s+do\s+Projeto\s*[:\-]?\s*(.*)", re.IGNORECASE)
+
+
+projetos = []
+projeto_atual = None
+aguardando_nup_numero = False
+
+
+with pdfplumber.open(pdf_path) as pdf:
+    for page in pdf.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+
+        for linha in text.split("\n"):
+            linha = linha.strip()
+
+            # Linha contém apenas "NUP" ou "N U P"
+            if re.fullmatch(r"N\s*U\s*P", linha, re.IGNORECASE):
+                aguardando_nup_numero = True
+                continue
+
+            # Número do NUP logo após "NUP"
+            if aguardando_nup_numero:
+                match = regex_nup_numero.search(linha)
+                if match:
+                    if projeto_atual:
+                        projetos.append(projeto_atual)
+
+                    projeto_atual = {
+                        "NUP": match.group(),
+                        "Parceria": None,
+                        "Título do Projeto": ""
+                    }
+                    aguardando_nup_numero = False
+                continue
+
+            # NUP normal (mesma linha)
+            if "NUP" in linha.upper():
+                match = regex_nup_numero.search(linha)
+                if match:
+                    if projeto_atual:
+                        projetos.append(projeto_atual)
+
+                    projeto_atual = {
+                        "NUP": match.group(),
+                        "Parceria": None,
+                        "Título do Projeto": ""
+                    }
+                continue
+
+            # NUP ÓRFÃO (SEM PALAVRA "NUP")
+            if projeto_atual is None:
+                match = regex_nup_numero.search(linha)
+                if match:
+                    projeto_atual = {
+                        "NUP": match.group(),
+                        "Parceria": None,
+                        "Título do Projeto": ""
+                    }
+                    continue
+
+            if not projeto_atual:
+                continue
+
+            # Parceria
+            match_parceria = regex_parceria.search(linha)
+            if match_parceria:
+                projeto_atual["Parceria"] = match_parceria.group(1)
+                continue
+
+            # Título (início)
+            match_titulo = regex_titulo_inicio.search(linha)
+            if match_titulo:
+                projeto_atual["Título do Projeto"] += match_titulo.group(1).strip()
+                continue
+
+            # Continuação do título
+            if projeto_atual["Título do Projeto"]:
+                if not regex_parceria.search(linha) and not regex_nup_numero.search(linha):
+                    projeto_atual["Título do Projeto"] += " " + linha
+
+
+# Último projeto
+if projeto_atual:
+    projetos.append(projeto_atual)
+
+# DataFrame e limpeza
+df = pd.DataFrame(projetos)
+
+df["Título do Projeto"] = (
+    df["Título do Projeto"]
+    .str.replace(r"\s+", " ", regex=True)
+    .str.strip()
+)
+
+# Validação NUP x Parceria
+df["Ano_NUP"] = df["NUP"].str.extract(r"(\d{4})")
+df["Ano_Parceria"] = df["Parceria"].str.extract(r"(\d{4})")
+df["Validação"] = df["Ano_NUP"] == df["Ano_Parceria"]
+df.drop(columns=["Ano_NUP", "Ano_Parceria"], inplace=True)
+
+# Exportar
+df.to_excel("resultado_final.xlsx", index=False)
+
+print(f"Projetos extraídos: {len(df)}")
+print(df.tail())
